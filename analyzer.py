@@ -1,127 +1,179 @@
-"""
-analyzer.py
-Envía las noticias a Claude AI y obtiene señales geopolíticas de compra/venta
-con porcentajes de confianza para NAS100 y XAUUSD.
-"""
-
 import os
+import asyncio
+import aiohttp
 import logging
-from datetime import datetime, timezone
-from anthropic import AsyncAnthropic
+from dotenv import load_dotenv
+load_dotenv()
+from datetime import datetime, timezone, timedelta
 from news_fetcher import get_all_news
 
 logger = logging.getLogger(__name__)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+# openrouter/free = router oficial que elige automaticamente el mejor modelo
+# gratuito disponible en cada momento. Nunca da 404.
+# Si esta saturado, fallback a modelos especificos actualizados julio 2026
+MODELS = [
+    "openrouter/auto",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "openai/gpt-4o-mini:free",
+    "nvidia/llama-3.1-nemotron-70b-instruct:free",
+    "openai/gpt-oss-120b:free",
+    "cohere/north-mini-code:free",
+]
 
-# ── Prompt del sistema ─────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """Eres un analista geopolítico senior especializado en mercados financieros globales.
-Tu función es evaluar el contexto geopolítico y macroeconómico mundial para generar señales de trading.
+_cache = {}
+CACHE_MINUTES = 15
 
-REGLAS ESTRICTAS:
-- Analiza SOLO desde perspectiva geopolítica y macroeconómica global (NO indicadores técnicos)
-- Sé específico: cita noticias concretas que justifican cada señal
-- Los porcentajes deben reflejar el peso REAL del contexto geopolítico actual
-- Si el contexto es muy incierto, refleja eso con porcentajes más bajos o NEUTRAL dominante
-- Siempre indica el horizonte temporal más probable de la señal (intraday / 1-3 días / semanal)
+def _get_cache(key):
+    if key in _cache:
+        entry = _cache[key]
+        if datetime.now(timezone.utc) < entry["expires"]:
+            remaining = int((entry["expires"] - datetime.now(timezone.utc)).total_seconds() / 60)
+            return entry["result"], remaining
+    return None, 0
 
-CONOCIMIENTO BASE:
-NAS100 (Nasdaq 100):
-- Sube con: optimismo económico USA, Fed dovish, buenas relaciones EEUU-China, estabilidad geopolítica, ciclo tech alcista
-- Baja con: tensiones EEUU-China (semicond.), Fed hawkish, recesión, guerras que afecten suministro energético/chips
+def _set_cache(key, result):
+    _cache[key] = {
+        "result":  result,
+        "expires": datetime.now(timezone.utc) + timedelta(minutes=CACHE_MINUTES),
+    }
 
-XAUUSD (Oro):
-- Sube con: incertidumbre geopolítica, guerras, inflación alta, debilidad dólar, compras bancos centrales, crisis bancaria
-- Baja con: dólar fuerte, Fed subiendo tipos agresivamente, reducción de riesgo global, estabilidad geopolítica"""
+SYSTEM_PROMPT = """Eres analista geopolitico senior en mercados financieros globales.
+Analiza SOLO desde perspectiva geopolitica y macroeconomica. NUNCA uses indicadores tecnicos.
+Cita noticias concretas para justificar cada factor.
+NAS100: sube con Fed dovish/paz geopolitica/EEUU-China estable/optimismo USA.
+Baja con Fed hawkish/tensiones China/recesion/guerras que afecten energia o chips.
+XAUUSD: sube con guerras/inflacion/dolar debil/crisis bancaria/bancos centrales comprando.
+Baja con dolar fuerte/Fed subiendo tipos/reduccion riesgo global."""
 
-# ── Formato de respuesta requerido ─────────────────────────────────────────────
-def build_user_prompt(instruments: list, news_text: str, now: str) -> str:
-    instruments_str = " y ".join(instruments)
-    return f"""FECHA Y HORA ACTUAL: {now}
-TOTAL NOTICIAS ANALIZADAS: incluidas abajo
+def build_prompt(instruments, news_text, now, count):
+    ins = " y ".join(instruments)
+    return f"""FECHA: {now} | NOTICIAS ANALIZADAS: {count}
 
-=== NOTICIAS GEOPOLÍTICAS RECIENTES ===
+=== TITULARES GEOPOLITICOS GLOBALES ===
 {news_text}
-========================================
+=======================================
 
-Analiza las noticias anteriores y genera señales geopolíticas para: {instruments_str}
+Genera senales geopoliticas para: {ins}
 
-Para CADA instrumento usa EXACTAMENTE este formato:
+Por cada instrumento usa ESTE FORMATO EXACTO:
 
----
-📊 **[INSTRUMENTO]**
-🎯 **Señal:** COMPRAR / VENDER / NEUTRAL
-📈 **% Comprar:** XX%
-📉 **% Vender:** XX%
-⚖️ **% Neutral:** XX%
-_(los tres porcentajes deben sumar 100%)_
+INSTRUMENTO: [nombre]
+Senal: COMPRAR / VENDER / NEUTRAL
+% Comprar: XX%
+% Vender: XX%
+% Neutral: XX%
+(los tres suman exactamente 100%)
 
-🔍 **Factores geopolíticos clave:**
-1. [factor 1 con noticia específica]
-2. [factor 2 con noticia específica]
-3. [factor 3 con noticia específica]
+Factores determinantes:
+1. [noticia concreta citada]
+2. [noticia concreta citada]
+3. [noticia concreta citada]
 
-⏱️ **Horizonte:** [intraday / 1-3 días / semanal]
-⚠️ **Riesgos a vigilar:** [2-3 riesgos geopolíticos concretos]
----
+Horizonte: [intraday / 1-3 dias / semanal]
+Eventos a vigilar: [3 eventos geopoliticos concretos]
+Certeza del analisis: [ALTA / MEDIA / BAJA] porque [razon]
 
-Responde en español. Sé conciso pero preciso. No añadas disclaimers al final."""
+Responde en espanol. Se muy especifico."""
 
-def format_news(articles: list) -> str:
+def format_news(articles):
     lines = []
     for i, a in enumerate(articles, 1):
-        pub = a.get("published", "")[:16] if a.get("published") else ""
-        lines.append(f"{i}. [{a['source']}]{' (' + pub + ')' if pub else ''} {a['title']}")
+        lines.append(f"{i}. [{a['source']}] {a['title']}")
         if a.get("summary"):
-            lines.append(f"   → {a['summary'][:200]}")
+            lines.append(f"   {a['summary'][:120]}")
     return "\n".join(lines)
 
-def escape_md(text: str) -> str:
-    """Escapa caracteres problemáticos para Telegram MarkdownV2."""
-    # Para Markdown V1 (parse_mode="Markdown") no se necesita escapar tanto
-    return text
+async def call_openrouter(session, model, prompt, attempt=0):
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/geosignal-bot",
+        "X-Title": "GeoSignal Bot",
+    }
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        "max_tokens": 1500,
+        "temperature": 0.1,
+    }
+    async with session.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=body,
+        timeout=aiohttp.ClientTimeout(total=90),
+    ) as resp:
+        data = await resp.json()
 
-# ── Función principal ──────────────────────────────────────────────────────────
-async def analyze_geopolitical_signal(instruments: list) -> str:
+        if resp.status == 429 and attempt < 2:
+            wait = 20
+            try:
+                wait = int(data["error"]["metadata"].get("retry_after_seconds", 20)) + 1
+            except:
+                pass
+            logger.info(f"Rate limit {model}, esperando {wait}s...")
+            await asyncio.sleep(wait)
+            return await call_openrouter(session, model, prompt, attempt + 1)
+
+        if resp.status != 200 or "error" in data:
+            raise Exception(data.get("error", {}).get("message", f"HTTP {resp.status}"))
+
+        return data["choices"][0]["message"]["content"].strip(), model
+
+async def analyze_geopolitical_signal(instruments):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    cache_key = "_".join(sorted(instruments))
 
-    # 1. Obtener noticias frescas
-    logger.info("Obteniendo noticias…")
+    # 1. Cache
+    cached, remaining = _get_cache(cache_key)
+    if cached:
+        return f"[Cache: actualiza en {remaining} min]\n\n" + cached
+
+    # 2. Noticias
+    logger.info("Obteniendo noticias...")
     articles = await get_all_news()
+    count = len(articles)
+    if count < 5:
+        return "Sin noticias disponibles. Intenta en 1 minuto."
 
-    if not articles:
-        return (
-            "⚠️ *No se pudieron obtener noticias en este momento.*\n"
-            "Verifica la conexión o las API keys. Intenta de nuevo en unos minutos."
-        )
+    news_text = format_news(articles[:80])
+    prompt = build_prompt(instruments, news_text, now, count)
 
-    news_text = format_news(articles)
-    user_prompt = build_user_prompt(instruments, news_text, now)
+    # 3. Probar modelos en orden
+    analysis = None
+    used_model = "desconocido"
 
-    # 2. Llamar a Claude
-    logger.info(f"Enviando {len(articles)} noticias a Claude para análisis…")
-    message = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1800,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}]
+    async with aiohttp.ClientSession() as session:
+        for model in MODELS:
+            try:
+                logger.info(f"Probando: {model}")
+                analysis, used_model = await call_openrouter(session, model, prompt)
+                used_model = used_model.split("/")[-1].replace(":free", "")
+                logger.info(f"Exito con: {model}")
+                break
+            except Exception as e:
+                logger.warning(f"{model} -> {e}")
+                await asyncio.sleep(2)
+                continue
+
+    if not analysis:
+        return "Modelos temporalmente ocupados. Intenta en 30 segundos."
+
+    label = " + ".join(instruments)
+    result = (
+        f"SENAL GEOPOLITICA - {label}\n"
+        f"{now}\n"
+        f"{count} noticias | {used_model}\n"
+        f"Valida {CACHE_MINUTES} minutos\n"
+        f"{'='*35}\n\n"
+        f"{analysis}\n\n"
+        f"{'='*35}\n"
+        f"Orientativo. No es asesoramiento financiero."
     )
 
-    analysis = message.content[0].text.strip()
-
-    # 3. Construir respuesta final
-    instruments_label = " + ".join(instruments)
-    header = (
-        f"🌍 *SEÑAL GEOPOLÍTICA — {instruments_label}*\n"
-        f"🕐 {now}\n"
-        f"📰 {len(articles)} noticias analizadas en tiempo real\n"
-        f"{'─' * 32}\n\n"
-    )
-
-    footer = (
-        f"\n{'─' * 32}\n"
-        f"_⚠️ Señal geopolítica. No es asesoramiento financiero._\n"
-        f"_Usa siempre gestión de riesgo._"
-    )
-
-    return header + analysis + footer
+    _set_cache(cache_key, result)
+    return result
